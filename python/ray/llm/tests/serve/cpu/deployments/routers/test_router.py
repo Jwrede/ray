@@ -18,8 +18,12 @@ from ray.llm._internal.serve.core.ingress.ingress import (
     OpenAiIngress,
     make_fastapi_ingress,
 )
+from ray.llm._internal.serve.core.ingress.route_tokenizer import RouteTokenizer
 from ray.llm._internal.serve.core.ingress.router import LLMRouter
 from ray.llm._internal.serve.core.server.llm_server import LLMServer
+from ray.llm._internal.serve.routing_policies.dynamo.kv_router_client import (
+    StubKvRouter,
+)
 from ray.llm.tests.serve.mocks.mock_vllm_engine import MockVLLMEngine
 from ray.serve._private.common import DeploymentID
 from ray.serve.exceptions import DeploymentUnavailableError
@@ -59,6 +63,11 @@ class _DirectRouterReplica:
 def _new_direct_router(handle=None):
     router = LLMRouter.__new__(LLMRouter)
     router._handle = handle or MagicMock()
+    # __init__ (bypassed here) also wires pre-routing tokenization. Mirror it so
+    # ``route`` can call _maybe_tokenize_and_rank. Tokenization is best-effort
+    # (returns None on any error) and never alters routing on this branch.
+    router._route_tokenizer = RouteTokenizer(router._handle)
+    router._kv_router = StubKvRouter()
     return router
 
 
@@ -84,7 +93,6 @@ def _choose_replica_returning(*replicas):
 
 @pytest.fixture(name="llm_config")
 def create_llm_config(stream_batching_interval_ms: Optional[int] = None):
-
     if stream_batching_interval_ms is not None:
         return LLMConfig(
             model_loading_config=ModelLoadingConfig(

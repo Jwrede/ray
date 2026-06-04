@@ -3,9 +3,20 @@ from typing import Optional, Tuple
 from fastapi import FastAPI, HTTPException, Request
 
 from ray import serve
+from ray.llm._internal.serve.core.ingress.route_tokenizer import (
+    RouteTokenizedRequest,
+    RouteTokenizer,
+)
+from ray.llm._internal.serve.observability.logging import get_logger
+from ray.llm._internal.serve.routing_policies.dynamo.kv_router_client import (
+    KvRouterClient,
+    StubKvRouter,
+)
 from ray.serve._private.http_util import _matches_session_id_header
 from ray.serve.exceptions import DeploymentUnavailableError
 from ray.serve.handle import DeploymentHandle
+
+logger = get_logger(__name__)
 
 _BODY_TRUNCATED_HEADER = "x-body-truncated"
 
@@ -63,6 +74,10 @@ class LLMRouter:
     async def __init__(self, server: DeploymentHandle):
         self._handle: DeploymentHandle = server
         self._handle._init()
+        # Tokenize pre-routing and feed token IDs to the KvRouter (stub for now)
+        # to lay the groundwork for KV-aware replica selection.
+        self._route_tokenizer = RouteTokenizer(self._handle)
+        self._kv_router: KvRouterClient = StubKvRouter()
 
     @router_app.post("/internal/route")
     async def route(self, request: Request):
@@ -79,6 +94,8 @@ class LLMRouter:
         handle = (
             self._handle.options(session_id=session_id) if session_id else self._handle
         )
+        # Tokenize and rank before picking; does not yet affect selection.
+        await self._maybe_tokenize_and_rank(body, body_truncated)
         try:
             host, port, replica_id = await self._pick_replica(
                 handle=handle,
@@ -92,6 +109,22 @@ class LLMRouter:
     @router_app.get("/health")
     async def health(self):
         return {"status": "ok"}
+
+    async def _maybe_tokenize_and_rank(
+        self, request_body: bytes, body_truncated: bool
+    ) -> Optional[RouteTokenizedRequest]:
+        """Tokenize via the replica's /tokenize endpoint and rank workers.
+
+        Returns the tokenized request, or ``None`` when tokenization is
+        skipped/fails so routing falls back gracefully. The ranking result is
+        not yet used to pick a replica.
+        """
+        rt = await self._route_tokenizer.tokenize(request_body, body_truncated)
+        if rt is None:
+            return None
+        await self._kv_router.rank_workers(rt.token_ids, allowed_worker_ids=None)
+        logger.debug("Pre-routing tokenization produced %d tokens", len(rt.token_ids))
+        return rt
 
     async def _pick_replica(
         self,
